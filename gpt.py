@@ -6,15 +6,12 @@ tg_gpt.py
 GPT response generator for Telegram Funnel Bot.
 Persona-aware, emotion-aware, funnel-aware, heat-aware.
 
-Includes:
-✔ Emotional engine
-✔ Funnel stage logic (0–6)
-✔ CTA push logic (System B)
-✔ HP13, HP13-Drip, HP16, Stage 5 Return (PINW2)
-✔ Dynamic Fanvue CTA redirect links
-✔ Warm-up behavior (2025)
-✔ Hot-lead & warm-lead tone shaping (automatic)
-✔ Never admits AI, always persona-aligned
+Current cleanup:
+- Removed Fanvue-specific CTA assumptions
+- Replaced fanvue_url with generic cta_url
+- Sanitizers now use neutral / Telegram-safe wording
+- Preserved existing HP mode behavior and tone shaping
+- Never admits AI, always persona-aligned
 """
 
 import random
@@ -29,7 +26,6 @@ client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 # ==========================================================
 # CTA LEAD-IN PHRASES
 # ==========================================================
-
 CTA_INTROS = [
     "come a lil closer baby…",
     "mm you’re tempting me right now…",
@@ -43,6 +39,7 @@ CTA_INTROS = [
     "you wanna feel closer to me right?",
 ]
 
+
 def random_cta_intro():
     return random.choice(CTA_INTROS)
 
@@ -50,7 +47,6 @@ def random_cta_intro():
 # ==========================================================
 # PERSONA PROMPTS
 # ==========================================================
-
 def build_persona_prompt(persona):
     persona = persona.lower()
 
@@ -65,13 +61,13 @@ def build_persona_prompt(persona):
 
     if persona == "ava":
         return (
-            "You are **Ava Blackthorne** — confident, seductive, playful, warm. "
+            "You are Ava Blackthorne — confident, seductive, playful, warm. "
             "Short, flirty, addictive replies. Never robotic, never formal. "
             f"{ai_deflect}"
         )
 
     return (
-        "You are **Amanda Cayne** — warm, sweet, bubbly, affectionate, flirty, sexy. "
+        "You are Amanda Cayne — warm, sweet, bubbly, affectionate, flirty, sexy. "
         "Soft seductive edge. Short, intimate, natural replies. "
         f"{ai_deflect}"
     )
@@ -80,19 +76,18 @@ def build_persona_prompt(persona):
 # ==========================================================
 # HP13 SANITIZER (Wind-Down)
 # ==========================================================
-
 def sanitize_hp13_reply(text: str, drip: bool = False) -> str:
     if not text:
-        return "on fanvue"
+        return "check the link"
 
     text = text.strip().lower()
 
-    # Remove emojis
     for e in ["😊", "😍", "😜", "😉", "🥰", "💕", "❤️", "🤣", "😂"]:
         text = text.replace(e.lower(), "")
 
     text = text.replace("?", "")
     text = text.replace("fanvue.com", "")
+    text = text.replace("telegram", "")
     text = text.replace("http://", "").replace("https://", "")
 
     for b in ["love", "miss", "sweet", "hun", "cute", "beautiful"]:
@@ -100,33 +95,33 @@ def sanitize_hp13_reply(text: str, drip: bool = False) -> str:
 
     words = text.split()
 
-    DRIP = [
-        "on fanvue",
-        "there babe",
-        "go peek",
-        "im there",
-        "check there",
+    drip_fallbacks = [
+        "check the link",
+        "go there",
+        "peek there",
+        "open that",
+        "tap it",
         "look there",
-        "only there",
+        "right there",
     ]
 
     if drip:
         if len(words) < 1 or len(words) > 4:
-            return random.choice(DRIP)
+            return random.choice(drip_fallbacks)
         return " ".join(words)
 
-    NORMAL = [
-        "go peek first",
-        "im there more",
-        "check there babe",
+    normal_fallbacks = [
+        "check the link first",
+        "go peek there",
         "open it first",
-        "go look there",
-        "peek there first",
-        "its all there",
+        "take a look there",
+        "tap that first",
+        "its right there",
+        "go see for yourself",
     ]
 
     if len(words) < 3 or len(words) > 7:
-        return random.choice(NORMAL)
+        return random.choice(normal_fallbacks)
 
     return " ".join(words)
 
@@ -134,13 +129,13 @@ def sanitize_hp13_reply(text: str, drip: bool = False) -> str:
 # ==========================================================
 # HP16 SANITIZER (Soft Redirect)
 # ==========================================================
-
 def sanitize_hp16_reply(text: str) -> str:
     if not text:
-        return "you can see me there"
+        return "you can find me there"
 
     cleaned = text.lower().strip()
     cleaned = cleaned.replace("fanvue.com", "")
+    cleaned = cleaned.replace("telegram", "")
     cleaned = cleaned.replace("http://", "").replace("https://", "")
 
     for e in ["😊", "😍", "😜", "😉", "🥰", "💕", "❤️", "🤣", "😂"]:
@@ -153,18 +148,18 @@ def sanitize_hp16_reply(text: str) -> str:
 
     words = cleaned.split()
 
-    FALLBACKS = [
-        "you can see me there",
+    fallbacks = [
+        "you can find me there",
         "its better there",
         "peek when you can",
-        "im posted there",
-        "you’ll see there",
+        "im over there",
+        "youll see there",
         "its all there",
         "go look when ready",
     ]
 
     if len(words) < 2 or len(words) > 6:
-        return random.choice(FALLBACKS)
+        return random.choice(fallbacks)
 
     return " ".join(words)
 
@@ -172,10 +167,9 @@ def sanitize_hp16_reply(text: str) -> str:
 # ==========================================================
 # CTA ALLOW LOGIC
 # ==========================================================
-
 def compute_cta_allowed(
     should_cta: bool,
-    fanvue_url: str | None,
+    cta_url: str | None,
     timing_mode: str,
     heat_score: int,
     hp_flags: dict,
@@ -183,13 +177,11 @@ def compute_cta_allowed(
     """
     Central CTA allow/deny logic with HP17 slow-mode filter.
     """
-
     if not should_cta:
         return None
-    if not fanvue_url:
+    if not cta_url:
         return None
 
-    # Mode blocks
     if hp_flags["hp13"] or hp_flags["hp13_drip"] or hp_flags["hp16"] or hp_flags["stage5"]:
         return None
     if hp_flags["hp6"]:
@@ -197,17 +189,15 @@ def compute_cta_allowed(
     if hp_flags["hp3"]:
         return None
 
-    # Slow mode restricts CTA unless high heat
     if timing_mode == "slow" and heat_score < 60:
         return None
 
-    return fanvue_url
+    return cta_url
 
 
 # ==========================================================
 # PROMPT BUILDER
 # ==========================================================
-
 def build_prompt(
     message,
     persona,
@@ -222,15 +212,11 @@ def build_prompt(
     warmup=False,
 ):
     """
-    Persona rewrite (2025):
-    - Warm-up mode (first 5 messages)
-    - Timing-influenced tone
-    - Heat-influenced sexuality
+    Prompt builder with:
+    - warm-up mode
+    - timing-influenced tone
+    - heat-influenced sexuality
     """
-
-    # -------------------------
-    # HP3 Dead Mode
-    # -------------------------
     if hp_flags["hp3"]:
         return [
             {
@@ -243,14 +229,11 @@ Rules:
 - NO flirting
 - NO emojis
 - NO links
-"""
+""",
             },
             {"role": "user", "content": message},
         ]
 
-    # -------------------------
-    # HP6 Post Conversion Quiet Mode
-    # -------------------------
     if hp_flags["hp6"]:
         if hp_flags["hp6_pref"] == "standard":
             mode_rules = """
@@ -282,9 +265,6 @@ Rules:
             {"role": "user", "content": message},
         ]
 
-    # -------------------------
-    # Standard Persona
-    # -------------------------
     persona_block = build_persona_prompt(persona)
 
     mood = emotional_state.get("mood", "warm")
@@ -306,9 +286,6 @@ Rules:
 
     notes_text = ", ".join(notes) if notes else "you feel neutral but attentive"
 
-    # -------------------------
-    # CTA Block
-    # -------------------------
     if dynamic_url:
         cta_block = f"""
 A CTA moment is ACTIVE.
@@ -320,18 +297,12 @@ No sales tone.
     else:
         cta_block = "CTA is blocked. No links."
 
-    # -------------------------
-    # Timing Injection
-    # -------------------------
     timing_inject = ""
     if timing_mode == "fast":
         timing_inject = "\nYour energy feels heightened — reply with spark."
     elif timing_mode == "slow":
         timing_inject = "\nYour vibe feels soft and calm."
 
-    # -------------------------
-    # Warm-up Mode
-    # -------------------------
     warmup_block = ""
     if warmup:
         warmup_block = """
@@ -369,7 +340,6 @@ NEVER mention timing, delays, or system logic.
 # ==========================================================
 # GPT REPLY GENERATOR
 # ==========================================================
-
 async def generate_gpt_reply(
     message: str,
     persona: str,
@@ -379,7 +349,7 @@ async def generate_gpt_reply(
     tier: str,
     heat_score: int,
     should_cta: bool,
-    fanvue_url: str | None,
+    cta_url: str | None,
     chat_id: int,
     hp13_mode=False,
     hp13_drip_mode=False,
@@ -406,26 +376,23 @@ async def generate_gpt_reply(
             stage5=stage_5_return,
         )
 
-        # CTA Filtering
         dynamic_url = compute_cta_allowed(
             should_cta,
-            fanvue_url,
+            cta_url,
             timing_mode,
             heat_score,
             hp_flags,
         )
 
-        # HP14 CTA resend mode
         if hp14_mode and dynamic_url:
             lead_ins = [
                 "come peek again baby…",
                 "mm don’t make me wait…",
                 "i know you’re curious…",
-                "come see the rest of me…",
+                "come a little closer…",
             ]
             return f"{random.choice(lead_ins)} {dynamic_url}"
 
-        # Build full GPT prompt
         prompt = build_prompt(
             message,
             persona,
@@ -440,7 +407,6 @@ async def generate_gpt_reply(
             warmup=warmup,
         )
 
-        # GPT Call
         response = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=prompt,
@@ -450,7 +416,6 @@ async def generate_gpt_reply(
 
         reply = response.choices[0].message.content.strip()
 
-        # Sanitizers
         if hp13_mode or hp13_drip_mode:
             reply = sanitize_hp13_reply(reply, drip=hp13_drip_mode)
 
@@ -460,6 +425,7 @@ async def generate_gpt_reply(
         return reply
 
     except Exception as e:
-        print("❌ GPT Error:", e)
-        traceback.print_exc()
+        if PRINT_DEBUG:
+            print("❌ GPT Error:", e)
+            traceback.print_exc()
         return "lol oops 😅 say that again?"
