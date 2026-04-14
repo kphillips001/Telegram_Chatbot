@@ -3,19 +3,28 @@
 
 """
 tg_listener_amanda.py
+
 Telethon user-mode DM listener for Amanda Cayne.
 Fully wired into PostgreSQL + emotional engine + GPT reply +
 typing simulation + HP17 timing engine + CTA safety + ban detection.
+
+Current cleanup status:
+- Uses Telegram/DMGate CTA URL via build_cta_link()
+- No Fanvue link dependency in listener flow
+- Avoids double-incrementing inbound message count
+- Reads API/session config from config.py
 """
 
-import os
 import asyncio
 import random
+import sys
 from datetime import datetime
-from dotenv import load_dotenv
+
 from telethon import TelegramClient, events
 
-asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+# Safe Windows event loop policy
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # DB Layer
 from database import (
@@ -27,11 +36,12 @@ from database import (
     mark_post_cta_response,
     update_field,
     update_last_inbound_ts,
-    update_cta_sent_ts
+    update_cta_sent_ts,
+    update_last_reply_time,
 )
 
 # Logic Layer
-from logic import process_message_logic
+from logic import process_message_logic, build_cta_link
 
 # Timing (HP17)
 from timing import (
@@ -39,18 +49,27 @@ from timing import (
     should_reply_now,
     compute_next_reply_time,
     now_est,
-    is_icebreaker_scenario
+    is_icebreaker_scenario,
 )
 
 # GPT
 from gpt import generate_gpt_reply
 
-from config import FANVUE_LINK_AMANDA
+from config import (
+    TG_API_ID,
+    TG_API_HASH,
+    BOT_NAME_AMANDA,
+    PRINT_DEBUG,
+)
+
 
 # ==========================================================
 # SUPER DEBUG LOGGER
 # ==========================================================
-def debug_state(label: str, user_row: dict, logic: dict, inbound_count: int):
+def debug_state(label: str, user_row: dict, logic: dict, inbound_count: int) -> None:
+    if not PRINT_DEBUG:
+        return
+
     print("\n" + "=" * 70)
     print(f"🔍 DEBUG → {label}")
     print("=" * 70)
@@ -93,32 +112,30 @@ def debug_state(label: str, user_row: dict, logic: dict, inbound_count: int):
 
     print("=" * 70 + "\n")
 
-# ==========================================================
-# ENV + SESSION
-# ==========================================================
-load_dotenv()
 
-API_ID = int(os.getenv("TG_API_ID", "0"))
-API_HASH = os.getenv("TG_API_HASH", "")
+# ==========================================================
+# SESSION
+# ==========================================================
 SESSION_NAME = "tg_sessions/amanda"
+BOT_NAME = BOT_NAME_AMANDA
 
-BOT_NAME = os.getenv("BOT_NAME_AMANDA", "amandacayne")
 
-
-async def increment_inbound_count(user_row):
-    telegram_id = user_row["telegram_id"]
-    inbound = (user_row.get("inbound_message_count") or 0) + 1
-    await update_field(telegram_id, "inbound_message_count", inbound)
-    return inbound
+def projected_inbound_count(user_row: dict) -> int:
+    """
+    Compute what the inbound count will be for this message
+    without writing to the DB here. process_message_logic()
+    performs the real increment.
+    """
+    return (user_row.get("inbound_message_count") or 0) + 1
 
 
 # ==========================================================
 # TYPING SIMULATION
 # ==========================================================
-def get_typing_speed(persona: str, emotional_state: dict):
+def get_typing_speed(persona: str, emotional_state: dict) -> float:
     mood = emotional_state.get("mood", "warm")
 
-    base = 0.9  # Amanda slightly faster
+    base = 0.9
     mood_map = {
         "intimate": 0.75,
         "teasing": 0.85,
@@ -129,7 +146,12 @@ def get_typing_speed(persona: str, emotional_state: dict):
     return base * mood_map.get(mood, 1.0)
 
 
-async def send_typing_action(client: TelegramClient, chat_id: int, reply: str, emotional_state: dict):
+async def send_typing_action(
+    client: TelegramClient,
+    chat_id: int,
+    reply: str,
+    emotional_state: dict,
+) -> None:
     length = len(reply)
     speed = get_typing_speed("amanda", emotional_state)
 
@@ -150,34 +172,35 @@ async def send_typing_action(client: TelegramClient, chat_id: int, reply: str, e
     while asyncio.get_event_loop().time() < end_time:
         try:
             await client.send_chat_action(chat_id, "typing")
-        except:
+        except Exception:
             pass
         await asyncio.sleep(0.7)
 
 
 # ==========================================================
-# MAIN LISTENER — CLEAN, FIXED, FINAL
+# MAIN LISTENER
 # ==========================================================
-
-async def main():
+async def main() -> None:
     print("🔌 Initializing database pool...")
     await init_pool()
 
     print("📲 Starting Amanda TG listener...")
-    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+    client = TelegramClient(SESSION_NAME, TG_API_ID, TG_API_HASH)
 
     await client.start()
     print("💬 Amanda Listener Ready.\n")
 
     @client.on(events.NewMessage(incoming=True))
     async def handle_new_message(event):
-
         if not event.is_private:
             return
 
         sender = await event.get_sender()
         telegram_id = sender.id
         incoming_text = event.raw_text.strip()
+
+        if not incoming_text:
+            return
 
         print(f"\n📥 Incoming DM from {sender.username or telegram_id}: {incoming_text}")
 
@@ -187,9 +210,10 @@ async def main():
         user_row = await load_or_create_user_from_telethon(sender)
 
         # -----------------------------------------------------
-        # Increment inbound count (warm-up logic)
+        # Compute projected inbound count
+        # NOTE: process_message_logic() performs the actual DB increment.
         # -----------------------------------------------------
-        inbound_count = await increment_inbound_count(user_row)
+        inbound_count = projected_inbound_count(user_row)
 
         # -----------------------------------------------------
         # HP17 BLOCK — enforce schedule (AFTER warm-up only)
@@ -200,7 +224,7 @@ async def main():
             if isinstance(next_after, str):
                 try:
                     next_after = datetime.fromisoformat(next_after)
-                except:
+                except Exception:
                     next_after = None
 
             if next_after and next_after.tzinfo:
@@ -221,11 +245,9 @@ async def main():
             return
 
         # -----------------------------------------------------
-        # Fanvue tracking link assignment
+        # CTA URL (Telegram / DMGate)
         # -----------------------------------------------------
-        fanvue_tracking_url = user_row.get("fanvue_tracking_url")
-        if not fanvue_tracking_url:
-            fanvue_tracking_url = f"{FANVUE_LINK_AMANDA}?ref=TGDM_{telegram_id}"
+        cta_url = build_cta_link(telegram_id, "amanda")
 
         # -----------------------------------------------------
         # Ghost return detection
@@ -237,8 +259,6 @@ async def main():
         # -----------------------------------------------------
         await log_message(telegram_id, "inbound", incoming_text, BOT_NAME)
         await touch_user_activity(telegram_id)
-
-        # Sexual Momentum — update inbound timestamp
         await update_last_inbound_ts(telegram_id)
 
         # -----------------------------------------------------
@@ -250,31 +270,21 @@ async def main():
 
         # -----------------------------------------------------
         # PROCESS MESSAGE (logic engine)
-        # Add raw_message for timing / icebreaker detection
         # -----------------------------------------------------
-        logic = await process_message_logic(
-            {**user_row},
-            incoming_text
-        )
-        logic["raw_message"] = incoming_text  # REQUIRED
+        logic = await process_message_logic({**user_row}, incoming_text)
+        logic["raw_message"] = incoming_text
 
         # -----------------------------------------------------
         # Inject warmup + icebreaker flags for debugging
         # -----------------------------------------------------
-        # Warmup flag
         is_warmup = (
-            logic["funnel_stage"] <= 1 and
-            inbound_count <= 5 and
-            logic["sexual_intensity"] in ("none", "flirty")
+            logic["funnel_stage"] <= 1
+            and inbound_count <= 5
+            and logic["sexual_intensity"] in ("none", "flirty")
         )
         logic["warmup_active"] = is_warmup
-
-        # Icebreaker flag
         logic["icebreaker_hit"] = is_icebreaker_scenario(user_row, logic)
 
-        # -----------------------------------------------------
-        # SUPER DEBUG LOG
-        # -----------------------------------------------------
         debug_state("POST-LOGIC STATE", user_row, logic, inbound_count)
 
         emotional_state = logic["emotional_state"]
@@ -282,15 +292,15 @@ async def main():
         should_cta = logic["should_cta"]
         heat_score = logic["heat_score"]
 
-        hp13_mode       = logic.get("hp13_mode", False)
-        hp13_drip_mode  = logic.get("hp13_drip_mode", False)
-        hp16_drip_mode  = logic.get("hp16_drip_mode", False)
-        stage_5_return  = logic.get("stage_5_return", False)
-        hp6_active      = logic.get("hp6_active", False)
-        hp6_pref        = logic.get("hp6_preference", None)
+        hp13_mode = logic.get("hp13_mode", False)
+        hp13_drip_mode = logic.get("hp13_drip_mode", False)
+        hp16_drip_mode = logic.get("hp16_drip_mode", False)
+        stage_5_return = logic.get("stage_5_return", False)
+        hp6_active = logic.get("hp6_active", False)
+        hp6_pref = logic.get("hp6_preference", None)
         hp6_inbound_cnt = logic.get("hp6_inbound_count", 0)
-        hp3_dead        = logic.get("hp3_dead", False)
-        hp14_mode       = logic.get("hp14_mode", False)
+        hp3_dead = logic.get("hp3_dead", False)
+        hp14_mode = logic.get("hp14_mode", False)
 
         # -----------------------------------------------------
         # HP3 — DEAD MODE
@@ -316,24 +326,14 @@ async def main():
             await asyncio.sleep(delay)
 
         else:
-            # -------------------------------------------------
-            # ICEBREAKER FAST-REPLY
-            # -------------------------------------------------
             if logic["icebreaker_hit"] and inbound_count <= 5:
                 delay = random.uniform(2.0, 8.0)
                 print(f"✨ ICEBREAKER → replying fast in {delay:.1f}s")
                 await asyncio.sleep(delay)
-
             else:
-                # -------------------------------------------------
-                # Stage 5: immediate replies
-                # -------------------------------------------------
                 if funnel_stage == 5 and not hp6_active:
                     print("🔥 Stage 5 override → Immediate reply allowed")
                 else:
-                    # -------------------------------------------------
-                    # HP17 TIMING ENGINE
-                    # -------------------------------------------------
                     if not should_reply_now({**user_row, **logic}):
                         print("⏳ BLOCKED by HP17 timing")
                         return
@@ -350,7 +350,7 @@ async def main():
             tier=user_row.get("country_tier", "C"),
             heat_score=heat_score,
             should_cta=should_cta,
-            fanvue_url=fanvue_tracking_url,
+            cta_url=cta_url,
             chat_id=telegram_id,
             hp13_mode=hp13_mode,
             hp13_drip_mode=hp13_drip_mode,
@@ -375,7 +375,6 @@ async def main():
             await event.respond(reply_text)
             print(f"📤 Sent → {reply_text}")
 
-            # If CTA fired, update CTA sent timestamp
             if logic.get("should_cta"):
                 await update_cta_sent_ts(telegram_id)
 
@@ -394,7 +393,6 @@ async def main():
         # -----------------------------------------------------
         # Save last reply time
         # -----------------------------------------------------
-        from database import update_last_reply_time
         await update_last_reply_time(telegram_id)
 
         # -----------------------------------------------------
