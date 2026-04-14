@@ -3,36 +3,45 @@
 
 """
 tg_grok.py
+
 Grok-based classifier for sentiment, sexual intent, and sexual intensity.
 Hardened + normalized version for PINW2.
+
+Cleanup status:
+- Removed raw API key printing
+- Removed module-level dotenv loading
+- Added safe optional debug logging via PRINT_DEBUG
+- Kept classifier behavior intact
 """
 
-# ==========================================================
-# LOAD .ENV BEFORE ANY CONFIG IMPORTS  (CRITICAL FIX)
-# ==========================================================
-from dotenv import load_dotenv
-load_dotenv()   # Must come BEFORE importing tg_config
-
-import os
-from config import GROK_API_KEY, GROK_MODEL, GROK_BASE_URL
 from openai import AsyncOpenAI
 
-print("DEBUG KEY FROM ENV IN tg_grok.py:", os.getenv("GROK_API_KEY"))
-print("Loaded Grok API Key:", GROK_API_KEY)
+from config import GROK_API_KEY, GROK_MODEL, GROK_BASE_URL, PRINT_DEBUG
 
-# Initialize Grok/OpenAI client (NEW GROK API — correct)
+
+# ==========================================================
+# OPTIONAL DEBUG LOGGER
+# ==========================================================
+def debug_log(*args) -> None:
+    if PRINT_DEBUG:
+        print(*args)
+
+
+# ==========================================================
+# CLIENT SETUP
+# ==========================================================
 client = AsyncOpenAI(
     api_key=GROK_API_KEY,
-    base_url=GROK_BASE_URL
+    base_url=GROK_BASE_URL,
 )
 
-print("Client sending this API KEY to Grok:", client.api_key)
+debug_log("✅ Grok client initialized")
+
 
 # ==========================================================
 # SAFE RESPONSE EXTRACTOR
 # ==========================================================
-
-def clean_response(resp):
+def clean_response(resp) -> str:
     if not resp:
         return ""
 
@@ -40,21 +49,21 @@ def clean_response(resp):
         msg = resp.choices[0].message.content
         if not msg:
             return ""
+
         msg = msg.strip().lower()
         msg = msg.replace(".", "").replace("!", "").replace(",", "")
 
-        # STEP 1: Debug output
-        print("CLEANED RESULT:", msg)
-
+        debug_log("CLEANED RESULT:", msg)
         return msg
+
     except Exception:
         return ""
+
 
 # ==========================================================
 # SENTIMENT CLASSIFIER
 # ==========================================================
 async def grok_sentiment(message: str) -> str:
-
     if not message or not message.strip():
         return "neutral"
 
@@ -69,7 +78,7 @@ async def grok_sentiment(message: str) -> str:
                 "- rude\n"
                 "- neutral\n\n"
                 "You must return ONLY the single word. No punctuation. No explanation."
-            )
+            ),
         },
         {"role": "user", "content": message},
     ]
@@ -83,12 +92,12 @@ async def grok_sentiment(message: str) -> str:
         )
 
         result = clean_response(resp)
-        allowed = ["sexual", "affectionate", "jealous", "rude", "neutral"]
+        allowed = {"sexual", "affectionate", "jealous", "rude", "neutral"}
 
         return result if result in allowed else "neutral"
 
     except Exception as e:
-        print(f"❌ Error in grok_sentiment: {e}")
+        debug_log(f"❌ Error in grok_sentiment: {e}")
         return "neutral"
 
 
@@ -96,7 +105,6 @@ async def grok_sentiment(message: str) -> str:
 # SEXUAL INTENT (YES / NO)
 # ==========================================================
 async def grok_is_sexual(message: str) -> bool:
-
     if not message or not message.strip():
         return False
 
@@ -108,7 +116,7 @@ async def grok_is_sexual(message: str) -> bool:
                 "Sexual intent includes explicit desire, fantasies, wanting sexual access, "
                 "dirty talk, or attempts to sexualize the conversation.\n\n"
                 "Respond ONLY with YES or NO."
-            )
+            ),
         },
         {"role": "user", "content": message},
     ]
@@ -125,7 +133,7 @@ async def grok_is_sexual(message: str) -> bool:
         return ans.startswith("y")
 
     except Exception as e:
-        print(f"❌ Error in grok_is_sexual: {e}")
+        debug_log(f"❌ Error in grok_is_sexual: {e}")
         return False
 
 
@@ -133,7 +141,6 @@ async def grok_is_sexual(message: str) -> bool:
 # SEXUAL INTENSITY CLASSIFIER
 # ==========================================================
 async def grok_sexual_intensity(message: str) -> str:
-
     if not message or not message.strip():
         return "none"
 
@@ -147,7 +154,7 @@ async def grok_sexual_intensity(message: str) -> str:
                 "- flirty\n"
                 "- none\n\n"
                 "Return ONLY the single word."
-            )
+            ),
         },
         {"role": "user", "content": message},
     ]
@@ -160,17 +167,13 @@ async def grok_sexual_intensity(message: str) -> str:
             max_tokens=5,
         )
 
-        # ==========================================================
-        # STEP 1: DEBUG — PRINT RAW GROK OUTPUT
-        # ==========================================================
-        print("\n================ GROK DEBUG ================")
-        print("INPUT:", message)
-        print("RAW RESPONSE OBJECT:", resp)
-        print("===========================================\n")
+        debug_log("\n================ GROK DEBUG ================")
+        debug_log("INPUT:", message)
+        debug_log("RAW RESPONSE OBJECT:", resp)
+        debug_log("===========================================\n")
 
         result = clean_response(resp)
 
-        # Normalization
         if "explicit" in result:
             result = "explicit"
         elif "strong" in result:
@@ -178,14 +181,13 @@ async def grok_sexual_intensity(message: str) -> str:
         elif "flirt" in result:
             result = "flirty"
 
-        # Sentiment override (NO internal import)
         sentiment = await grok_sentiment(message)
         if sentiment == "rude":
             return "none"
 
-        allowed = ["explicit", "strong", "flirty", "none"]
+        allowed = {"explicit", "strong", "flirty", "none"}
         return result if result in allowed else "none"
 
     except Exception as e:
-        print(f"❌ Error in grok_sexual_intensity: {e}")
+        debug_log(f"❌ Error in grok_sexual_intensity: {e}")
         return "none"
